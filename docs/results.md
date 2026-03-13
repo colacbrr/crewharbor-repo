@@ -60,5 +60,6 @@ The benchmark pattern is useful for discussion:
 - retrieval remains fast even as the index scales
 - retrieval quality declines as the search space grows
 - the explanation layer becomes the main UX bottleneck
+- cached explanations can reduce repeated-query cost during local evaluation
 
 That tradeoff is valuable because it turns the demo into a systems discussion, not only a model demo.

@@ -27,6 +27,7 @@ Expected capabilities:
 - metrics endpoints
 - logs/events streaming
 - grounded explanation endpoint
+- model discovery endpoint
 
 ## Frontend
 
@@ -55,4 +56,4 @@ What to highlight:
 - retrieval remains interactive at both 1k and 5k scale
 - quality drops as the search space expands, which is expected and useful to analyze
 - the explanation layer is much slower than raw retrieval
-- this opens practical discussions around caching, UX, and production tradeoffs
+- the cache/fallback path makes the explanation flow more resilient during repeated demos

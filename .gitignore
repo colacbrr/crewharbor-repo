@@ -5,6 +5,10 @@ venv/
 mir_venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.coverage
+.coverage.*
 .env
 .DS_Store
 
@@ -12,3 +16,6 @@ __pycache__/
 backend/val2017/
 backend/annotations/
 backend/outputs/
+frontend/node_modules/
+frontend/dist/
+backend/.venv/

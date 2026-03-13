@@ -34,6 +34,8 @@ export default function App() {
   const [explainStatus, setExplainStatus] = useState("idle");
   const [explainError, setExplainError] = useState(null);
   const [explainMeta, setExplainMeta] = useState(null);
+  const [explainItems, setExplainItems] = useState([]);
+  const [explainContext, setExplainContext] = useState(null);
   const explainAbortRef = useRef(null);
   const [topK, setTopK] = useState(5);
   const [rerank, setRerank] = useState(true);
@@ -45,6 +47,37 @@ export default function App() {
   const [benchmarks, setBenchmarks] = useState({ run_1000: null, run_5000: null });
   const [selectedResult, setSelectedResult] = useState(null);
   const [showResearch, setShowResearch] = useState(true);
+  const overviewStats = useMemo(
+    () => [
+      {
+        label: "Indexed images",
+        value: statusInfo?.index_size ?? "n/a",
+        note: statusInfo ? `target ${statusInfo.max_images}` : "awaiting backend"
+      },
+      {
+        label: "Avg search",
+        value:
+          typeof metricsSummary?.avg_search_ms === "number"
+            ? `${metricsSummary.avg_search_ms} ms`
+            : "n/a",
+        note: "retrieval only"
+      },
+      {
+        label: "Avg explanation",
+        value:
+          typeof metricsSummary?.avg_llm_ms === "number"
+            ? `${metricsSummary.avg_llm_ms} ms`
+            : "n/a",
+        note: "local Ollama"
+      },
+      {
+        label: "Cache hits",
+        value: metricsSummary?.cache_hits ?? "n/a",
+        note: "RAG reuse"
+      }
+    ],
+    [metricsSummary, statusInfo]
+  );
 
   const requestExplanation = () => {
     if (!debouncedQuery || results.length === 0 || explainStatus === "loading") return;
@@ -57,6 +90,8 @@ export default function App() {
     setExplainStatus("loading");
     setExplainError(null);
     setExplainMeta(null);
+    setExplainItems([]);
+    setExplainContext(null);
 
     const payload = {
       query: debouncedQuery,
@@ -91,12 +126,18 @@ export default function App() {
           throw new Error("The Ollama response did not include an explanation.");
         }
         setExplanation(message);
+        setExplainItems(Array.isArray(data.items) ? data.items : []);
+        setExplainContext(data.context || null);
         setExplainStatus("ready");
         setExplainMeta({
           model: data.model || data.ollama_model || null,
           duration_ms: data.duration_ms || data.latency_ms || null,
           prompt_tokens: data.prompt_tokens || null,
-          completion_tokens: data.completion_tokens || null
+          completion_tokens: data.completion_tokens || null,
+          uncertainty: data.uncertainty || null,
+          cache_hit: Boolean(data.cache_hit),
+          prompt_version: data.prompt_version || null,
+          used_fallback: Boolean(data.used_fallback)
         });
       })
       .catch((err) => {
@@ -276,6 +317,8 @@ export default function App() {
       setExplainStatus("idle");
       setExplainError(null);
       setExplainMeta(null);
+      setExplainItems([]);
+      setExplainContext(null);
       setLatencyMs(null);
       return;
     }
@@ -287,6 +330,8 @@ export default function App() {
     setExplainStatus("idle");
     setExplainError(null);
     setExplainMeta(null);
+    setExplainItems([]);
+    setExplainContext(null);
     setLatencyMs(null);
     setSelectedResult(null);
 
@@ -381,13 +426,18 @@ export default function App() {
     <div className="app-shell">
       <div className="glow-layer" aria-hidden="true" />
       <header className="hero">
-        <div>
+        <div className="hero-copy">
           <div className="brand">MIR Lab</div>
           <h1>Semantic multimedia search engine</h1>
           <p>
-            Local CLIP + FAISS + RAG baseline designed for direct comparison with
-            larger multimodal and cloud-backed architectures.
+            A local-first retrieval system for image search, caption-aware reranking,
+            and explanation generation over the retrieved evidence.
           </p>
+          <div className="hero-points">
+            <span>Problem: bridge user intent and visual content</span>
+            <span>Method: CLIP embeddings + FAISS + grounded explanation</span>
+            <span>Tradeoff: fast retrieval, slower generation</span>
+          </div>
         </div>
         <div className="status-card">
           <div className="status-row">
@@ -450,42 +500,52 @@ export default function App() {
         </div>
       </header>
 
+      <section className="overview-strip">
+        {overviewStats.map((item) => (
+          <article key={item.label} className="overview-card">
+            <div className="overview-label">{item.label}</div>
+            <div className="overview-value">{item.value}</div>
+            <div className="overview-note">{item.note}</div>
+          </article>
+        ))}
+      </section>
+
       <main>
         <section className="insights">
           <article className="insight-card">
-            <h3>Core architecture</h3>
+            <h3>What problem it solves</h3>
             <p>
-              CLIP-based multimodal encoding, FAISS vector search, and grounded RAG
-              explanations running locally for traceability.
+              Keyword search is weak for images. This pipeline maps text queries and
+              images into one semantic space, then explains why specific matches were retrieved.
             </p>
             <div className="badge-row">
-              <span className="badge">CLIP ViT</span>
-              <span className="badge">FAISS HNSW</span>
-              <span className="badge">Ollama RAG</span>
+              <span className="badge">semantic search</span>
+              <span className="badge">multimodal retrieval</span>
+              <span className="badge">traceable outputs</span>
             </div>
           </article>
           <article className="insight-card">
-            <h3>Controlled methodology</h3>
+            <h3>Core pipeline</h3>
             <p>
-              Deterministic indexing, versioned query sets, and automatic metrics
-              such as Recall@K, latency, and throughput.
+              Retrieval is split into embedding, vector search, optional caption reranking,
+              and a local explanation stage over the top retrieved items.
             </p>
             <div className="badge-row">
               <span className="badge">Recall@K</span>
-              <span className="badge">MRR</span>
-              <span className="badge">nDCG</span>
+              <span className="badge">latency</span>
+              <span className="badge">prompt versioning</span>
             </div>
           </article>
           <article className="insight-card">
-            <h3>Multi-cloud roadmap</h3>
+            <h3>Engineering angle</h3>
             <p>
-              Controlled replication across Redshift, Synapse, and BigQuery with
-              managed search services for comparative evaluation.
+              The system exposes measurable behavior, cached explanations, fallback handling,
+              and a modular path toward larger multimodal retrieval workflows.
             </p>
             <div className="badge-row">
-              <span className="badge">AWS</span>
-              <span className="badge">Azure</span>
-              <span className="badge">GCP</span>
+              <span className="badge">local-first</span>
+              <span className="badge">measurable</span>
+              <span className="badge">extensible</span>
             </div>
           </article>
         </section>
@@ -671,12 +731,35 @@ export default function App() {
             <div className="explain-meta">
               {explainMeta.model && <span>Model: {explainMeta.model}</span>}
               {explainMeta.duration_ms && <span>Duration: {explainMeta.duration_ms}ms</span>}
+              {explainMeta.uncertainty && <span>Uncertainty: {explainMeta.uncertainty}</span>}
+              {explainMeta.cache_hit && <span>Cache: hit</span>}
+              {explainMeta.used_fallback && <span>Output: fallback</span>}
+              {explainMeta.prompt_version && <span>Prompt: {explainMeta.prompt_version}</span>}
               {explainMeta.prompt_tokens && (
                 <span>Prompt: {explainMeta.prompt_tokens} tok</span>
               )}
               {explainMeta.completion_tokens && (
                 <span>Completion: {explainMeta.completion_tokens} tok</span>
               )}
+            </div>
+          )}
+          {explainItems.length > 0 && (
+            <div className="explain-meta">
+              {explainItems.map((item) => (
+                <span key={`${item.file_name}-${item.score_pct}`}>
+                  {item.file_name}: {item.score_pct?.toFixed ? item.score_pct.toFixed(1) : item.score_pct}%
+                </span>
+              ))}
+            </div>
+          )}
+          {explainContext?.lines?.length > 0 && (
+            <div className="context-card">
+              <div className="context-title">Retrieved context sent to the model</div>
+              <div className="context-lines">
+                {explainContext.lines.map((line, idx) => (
+                  <div key={`${line}-${idx}`}>{line}</div>
+                ))}
+              </div>
             </div>
           )}
         </section>
@@ -796,6 +879,18 @@ export default function App() {
                   <span className="metric-label">Avg LLM</span>
                   <span className="metric-value">
                     {metricsSummary?.avg_llm_ms ?? "n/a"} ms
+                  </span>
+                </div>
+                <div>
+                  <span className="metric-label">Cache hits</span>
+                  <span className="metric-value">
+                    {metricsSummary?.cache_hits ?? "n/a"}
+                  </span>
+                </div>
+                <div>
+                  <span className="metric-label">Failures</span>
+                  <span className="metric-value">
+                    {metricsSummary?.failure_count ?? "n/a"}
                   </span>
                 </div>
               </div>

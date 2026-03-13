@@ -125,6 +125,11 @@ footer {
   backdrop-filter: blur(6px);
 }
 
+.hero-copy {
+  display: grid;
+  gap: 16px;
+}
+
 .brand {
   text-transform: uppercase;
   letter-spacing: 0.35em;
@@ -141,6 +146,58 @@ footer {
   padding: 18px 20px;
   display: grid;
   gap: 14px;
+}
+
+.hero-points {
+  display: grid;
+  gap: 10px;
+}
+
+.hero-points span {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(27, 23, 20, 0.08);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.overview-strip {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  animation: fadeUp 0.62s ease-out;
+}
+
+.overview-card {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(255, 255, 255, 0.78));
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 22px;
+  padding: 18px;
+  box-shadow: var(--shadow);
+  display: grid;
+  gap: 8px;
+}
+
+.overview-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+}
+
+.overview-value {
+  font-family: "Fraunces", "Times New Roman", serif;
+  font-size: clamp(1.5rem, 1vw + 1.2rem, 2.1rem);
+  line-height: 1;
+}
+
+.overview-note {
+  font-size: 12px;
+  color: var(--muted);
 }
 
 .status-row {
@@ -825,6 +882,13 @@ main {
   display: flex;
   flex-direction: column;
   cursor: pointer;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+
+.result-card:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 24px 44px rgba(27, 23, 20, 0.16);
+  border-color: rgba(45, 107, 115, 0.2);
 }
 
 .result-card:focus {
@@ -843,6 +907,11 @@ main {
   height: 100%;
   object-fit: cover;
   display: block;
+  transition: transform 0.5s ease;
+}
+
+.result-card:hover .result-media img {
+  transform: scale(1.03);
 }
 
 .result-body {
@@ -889,6 +958,32 @@ mark {
   padding: 24px;
   font-size: 14px;
   color: var(--muted);
+}
+
+.context-card {
+  display: grid;
+  gap: 10px;
+  background: rgba(27, 23, 20, 0.05);
+  border-radius: 16px;
+  padding: 14px 16px;
+  border: 1px solid rgba(27, 23, 20, 0.08);
+}
+
+.context-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--muted);
+}
+
+.context-lines {
+  display: grid;
+  gap: 6px;
+  font-family: "SFMono-Regular", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  font-size: 11px;
+  color: var(--ink);
+  line-height: 1.45;
 }
 
 footer {

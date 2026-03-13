@@ -7,7 +7,7 @@ This project has two main parts:
 - `backend/` for the FastAPI retrieval service
 - `frontend/` for the React + Vite demo UI
 
-The repository is a cleaned public-facing skeleton, so the dataset and generated outputs are not included by default.
+The dataset and generated outputs are not included by default.
 
 ## Prerequisites
 
@@ -16,6 +16,12 @@ Install locally:
 - Python 3.10+
 - Node.js 18+
 - Ollama
+
+Ollama installation:
+
+- macOS: install from the official Ollama app or package manager, then open the app once
+- Linux: install the Ollama service, then verify with `ollama list`
+- Windows: install Ollama Desktop, make sure the local service is running, then verify with `ollama list`
 
 You also need the dataset files expected by the backend:
 
@@ -40,8 +46,11 @@ pip install -r requirements.txt
 If you want grounded explanations, make sure Ollama is available and a model is installed. Example:
 
 ```bash
+ollama list
 ollama pull llama3.1:8b
 ```
+
+If `ollama list` fails, the local Ollama service is not available yet.
 
 ## 2. Dataset Placement
 
@@ -77,9 +86,11 @@ Useful endpoints:
 
 - `/status`
 - `/search`
+- `/rag`
 - `/explain`
 - `/metrics/summary`
 - `/benchmarks`
+- `/ollama/models`
 
 ## 4. Start The Frontend
 
@@ -113,6 +124,8 @@ Once both services are running:
 4. inspect the returned images
 5. trigger `Generate explanation`
 
+For the first full run, expect startup to be slower because embeddings and the index may need to be built.
+
 ## 6. Optional Environment Variables
 
 The backend supports configuration through environment variables.
@@ -127,6 +140,8 @@ MIR_HNSW_EF=64
 MIR_RERANK=true
 MIR_RERANK_ALPHA=0.25
 MIR_RAG_MODEL=llama3.1:8b
+MIR_RAG_TIMEOUT_SEC=45
+MIR_RAG_CACHE_TTL_SEC=300
 ```
 
 Example startup:
@@ -135,7 +150,35 @@ Example startup:
 MIR_MAX_IMAGES=1000 MIR_INDEX_TYPE=hnsw python search_server.py
 ```
 
-## 7. Common Issues
+## 7. API Examples
+
+Search:
+
+```bash
+curl "http://localhost:8000/search?query=sunset%20over%20the%20ocean&top_k=5&rerank=true"
+```
+
+Explain from retrieved results:
+
+```bash
+curl -X POST "http://localhost:8000/explain" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "sunset over the ocean",
+    "model": "llama3.1:8b",
+    "results": [
+      { "file_name": "000000000139.jpg", "caption": "A red sunset over the sea.", "score": 0.47 }
+    ]
+  }'
+```
+
+Direct retrieval-plus-generation in one request:
+
+```bash
+curl "http://localhost:8000/rag?query=sunset%20over%20the%20ocean&top_k=5&rerank=true"
+```
+
+## 8. Common Issues
 
 ### Backend starts but search returns no results
 
@@ -157,6 +200,7 @@ Check:
 Check:
 
 - Ollama is installed
+- `ollama list` returns available local models
 - the selected model is available
 - the backend can access the Ollama service
 

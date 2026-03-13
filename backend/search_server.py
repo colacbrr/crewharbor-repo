@@ -1,10 +1,9 @@
 import json
-import os
 import random
 import subprocess
-import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,7 +16,40 @@ from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
+
+from config import (
+    CLIP_MODEL_NAME,
+    FUTURE_MODALITIES,
+    HNSW_EF,
+    HNSW_M,
+    INDEX_TYPE,
+    MAX_IMAGES,
+    PORT,
+    PROMPT_VERSION,
+    RAG_CACHE_TTL_SEC,
+    RAG_MAX_CAPTION_CHARS,
+    RAG_MAX_CONTEXT_ITEMS,
+    RAG_MODEL,
+    RAG_NUM_PREDICT,
+    RAG_TEMPERATURE,
+    RAG_TIMEOUT_SEC,
+    RAG_TOP_P,
+    RERANK_ALPHA,
+    RERANK_ENABLED,
+    SUPPORTED_MODALITIES,
+)
+from metrics_utils import load_jsonl_events, summarize_events
+from rag import (
+    build_context_lines,
+    build_prompt,
+    build_structured_fallback,
+    extract_usage,
+    normalize_results,
+    parse_structured_response,
+    stable_cache_key,
+)
 
 try:
     import ollama
@@ -25,20 +57,6 @@ except Exception:
     ollama = None
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CLIP_MODEL_NAME = os.getenv("MIR_CLIP_MODEL", "ViT-B/32")
-INDEX_TYPE = os.getenv("MIR_INDEX_TYPE", "flat").lower()
-HNSW_M = int(os.getenv("MIR_HNSW_M", "32"))
-HNSW_EF = int(os.getenv("MIR_HNSW_EF", "64"))
-RERANK_ENABLED = os.getenv("MIR_RERANK", "true").lower() in {"1", "true", "yes"}
-RERANK_ALPHA = float(os.getenv("MIR_RERANK_ALPHA", "0.25"))
-RAG_MODEL = os.getenv("MIR_RAG_MODEL", "llama3.1:8b")
-RAG_TEMPERATURE = float(os.getenv("MIR_RAG_TEMPERATURE", "0.2"))
-RAG_TOP_P = float(os.getenv("MIR_RAG_TOP_P", "0.9"))
-RAG_NUM_PREDICT = int(os.getenv("MIR_RAG_NUM_PREDICT", "256"))
-MAX_IMAGES = int(os.getenv("MIR_MAX_IMAGES", "1000"))
-PORT = int(os.getenv("MIR_PORT", "8000"))
-SUPPORTED_MODALITIES = {"image"}
-FUTURE_MODALITIES = {"video", "audio"}
 
 BASE_DIR = Path(__file__).resolve().parent
 COCO_IMAGES = BASE_DIR / "val2017"
@@ -102,7 +120,25 @@ _metrics = {
     "query_count": 0,
     "query_total_ms": 0.0,
     "last_query_ms": None,
+    "rag_query_count": 0,
+    "rag_cache_hits": 0,
+    "rag_failures": 0,
 }
+_rag_cache = {}
+_rag_cache_lock = threading.Lock()
+
+
+class ExplainResultItem(BaseModel):
+    file_name: str
+    caption: str | None = None
+    score: float | None = None
+    image_url: str | None = None
+
+
+class ExplainRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    model: str | None = None
+    results: list[ExplainResultItem] = Field(..., min_length=1)
 
 
 def _log(message):
@@ -366,40 +402,7 @@ def _update_query_metrics(latency_ms):
 
 
 def _summarize_metrics_from_log(limit=1000):
-    if not METRICS_LOG_FILE.exists():
-        return {"events": 0}
-    events = []
-    try:
-        with METRICS_LOG_FILE.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except Exception:
-                    continue
-        if limit and len(events) > limit:
-            events = events[-limit:]
-    except Exception:
-        return {"events": 0}
-
-    if not events:
-        return {"events": 0}
-
-    def avg(values):
-        return round(sum(values) / len(values), 2) if values else None
-
-    search_lat = [e.get("latency_ms") for e in events if e.get("type") == "search"]
-    search_lat = [v for v in search_lat if isinstance(v, (int, float))]
-    rag_llm = [e.get("llm_ms") for e in events if e.get("type") in {"rag", "explain"}]
-    rag_llm = [v for v in rag_llm if isinstance(v, (int, float))]
-
-    return {
-        "events": len(events),
-        "avg_search_ms": avg(search_lat),
-        "avg_llm_ms": avg(rag_llm),
-    }
+    return summarize_events(load_jsonl_events(METRICS_LOG_FILE, limit=limit))
 
 
 def _evaluate_recall(sample_size=200, ks=(1, 5, 10), seed=42):
@@ -506,44 +509,124 @@ def _read_json_file(path: Path):
         return None
 
 
-def _build_structured_fallback(query, results):
-    lines = [f"Summary: The query returned {len(results)} relevant results."]
-    for idx, item in enumerate(results, start=1):
-        caption = item.get("caption") or "no caption"
-        score_pct = item.get("score", 0.0) * 100.0
-        lines.append(
-            f"{idx}) {item.get('file_name', f'item_{idx}')} — {caption}. Score: {score_pct:.1f}%"
+def _api_error(message, code, **extra):
+    payload = {"ok": False, "error": message, "error_code": code}
+    payload.update(extra)
+    return payload
+
+
+def _avg_query_ms():
+    if not _metrics["query_count"]:
+        return None
+    return round(_metrics["query_total_ms"] / _metrics["query_count"], 2)
+
+
+def _cache_get(cache_key):
+    now = time.time()
+    with _rag_cache_lock:
+        entry = _rag_cache.get(cache_key)
+        if not entry:
+            return None
+        if entry["expires_at"] < now:
+            _rag_cache.pop(cache_key, None)
+            return None
+        return entry["value"]
+
+
+def _cache_set(cache_key, payload):
+    with _rag_cache_lock:
+        _rag_cache[cache_key] = {
+            "expires_at": time.time() + RAG_CACHE_TTL_SEC,
+            "value": payload,
+        }
+
+
+def _generate_with_timeout(selected_model, prompt):
+    def _run():
+        return ollama.generate(
+            model=selected_model,
+            prompt=prompt,
+            options={
+                "temperature": RAG_TEMPERATURE,
+                "top_p": RAG_TOP_P,
+                "num_predict": RAG_NUM_PREDICT,
+            },
         )
-    return "\n".join(lines)
 
-
-def _parse_structured_response(text, fallback_text):
-    if not text:
-        return fallback_text
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        return fallback_text
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(_run)
     try:
-        data = json.loads(match.group(0))
-    except Exception:
-        return fallback_text
+        return future.result(timeout=RAG_TIMEOUT_SEC)
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(f"Ollama timed out after {RAG_TIMEOUT_SEC:.0f}s") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
-    summary = data.get("summary")
-    items = data.get("items") if isinstance(data.get("items"), list) else []
-    if not summary or not items:
-        return fallback_text
 
-    lines = [f"Summary: {summary.strip()}"]
-    for idx, item in enumerate(items, start=1):
-        file_name = item.get("file_name") or f"item_{idx}"
-        caption = item.get("caption") or "no caption"
-        score_pct = item.get("score_pct")
-        if isinstance(score_pct, (int, float)):
-            score_str = f"{score_pct:.1f}%"
-        else:
-            score_str = "n/a"
-        lines.append(f"{idx}) {file_name} — {caption}. Score: {score_str}")
-    return "\n".join(lines)
+def _build_rag_payload(query, results, selected_model, raw_text, llm_ms, usage, cache_hit):
+    normalized = normalize_results(
+        results,
+        max_items=RAG_MAX_CONTEXT_ITEMS,
+        max_caption_chars=RAG_MAX_CAPTION_CHARS,
+    )
+    fallback = build_structured_fallback(query, normalized)
+    parsed = parse_structured_response(raw_text, fallback)
+    return {
+        "ok": True,
+        "query": query,
+        "model": selected_model,
+        "prompt_version": PROMPT_VERSION,
+        "llm_ms": round(llm_ms, 2),
+        "duration_ms": round(llm_ms, 2),
+        "cache_hit": cache_hit,
+        "summary": parsed["summary"],
+        "uncertainty": parsed.get("uncertainty"),
+        "items": parsed["items"],
+        "answer": parsed["formatted"],
+        "explanation": parsed["formatted"],
+        "used_fallback": parsed.get("used_fallback", False),
+        "raw_response": raw_text,
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "context": {
+            "query": query,
+            "results": normalized,
+            "lines": build_context_lines(normalized),
+        },
+    }
+
+
+def _run_rag(query, results, selected_model):
+    normalized = normalize_results(
+        results,
+        max_items=RAG_MAX_CONTEXT_ITEMS,
+        max_caption_chars=RAG_MAX_CAPTION_CHARS,
+    )
+    cache_key = stable_cache_key(query, selected_model, normalized, PROMPT_VERSION)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        _metrics["rag_query_count"] += 1
+        _metrics["rag_cache_hits"] += 1
+        return {**cached, "cache_hit": True}
+
+    context_lines = build_context_lines(normalized)
+    prompt = build_prompt(query, context_lines, PROMPT_VERSION)
+    llm_start = time.perf_counter()
+    response = _generate_with_timeout(selected_model, prompt)
+    llm_ms = (time.perf_counter() - llm_start) * 1000.0
+    payload = _build_rag_payload(
+        query=query,
+        results=normalized,
+        selected_model=selected_model,
+        raw_text=response.get("response", ""),
+        llm_ms=llm_ms,
+        usage=extract_usage(response),
+        cache_hit=False,
+    )
+    _cache_set(cache_key, payload)
+    _metrics["rag_query_count"] += 1
+    return payload
 
 
 def _build_results(query, top_k, rerank, rerank_alpha):
@@ -615,12 +698,8 @@ def status():
     manifest = None
     if MANIFEST_FILE.exists():
         manifest = json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
-    avg_query_ms = None
-    if _metrics["query_count"]:
-        avg_query_ms = round(
-            _metrics["query_total_ms"] / _metrics["query_count"], 2
-        )
     return {
+        "ok": True,
         "ready": _ready,
         "device": DEVICE,
         "index_size": len(_image_files),
@@ -634,22 +713,26 @@ def status():
         "rerank": RERANK_ENABLED,
         "rerank_alpha_default": RERANK_ALPHA,
         "rag_model": RAG_MODEL,
+        "rag_timeout_sec": RAG_TIMEOUT_SEC,
+        "rag_cache_ttl_sec": RAG_CACHE_TTL_SEC,
+        "prompt_version": PROMPT_VERSION,
         "manifest": manifest,
         "metrics": {
             **_metrics,
-            "avg_query_ms": avg_query_ms,
+            "avg_query_ms": _avg_query_ms(),
         },
     }
 
 
 @app.get("/health")
 def health():
-    return {"ready": _ready, "error": _init_error}
+    return {"ok": True, "ready": _ready, "error": _init_error}
 
 
 @app.get("/capabilities")
 def capabilities():
     return {
+        "ok": True,
         "modalities_supported": sorted(SUPPORTED_MODALITIES),
         "modalities_planned": sorted(FUTURE_MODALITIES),
         "index_types": ["flat", "hnsw"],
@@ -661,6 +744,7 @@ def capabilities():
 @app.get("/config")
 def config():
     return {
+        "ok": True,
         "device": DEVICE,
         "index_type": INDEX_TYPE,
         "hnsw_m": HNSW_M,
@@ -672,6 +756,9 @@ def config():
         "rag_temperature": RAG_TEMPERATURE,
         "rag_top_p": RAG_TOP_P,
         "rag_num_predict": RAG_NUM_PREDICT,
+        "rag_timeout_sec": RAG_TIMEOUT_SEC,
+        "rag_cache_ttl_sec": RAG_CACHE_TTL_SEC,
+        "prompt_version": PROMPT_VERSION,
         "max_images": MAX_IMAGES,
     }
 
@@ -679,6 +766,7 @@ def config():
 @app.get("/benchmarks")
 def benchmarks():
     return {
+        "ok": True,
         "run_1000": _read_json_file(BENCHMARK_1K),
         "run_5000": _read_json_file(BENCHMARK_5K),
     }
@@ -728,19 +816,20 @@ def search(
     modality: str = Query("image"),
 ):
     if modality not in SUPPORTED_MODALITIES:
-        return {
-            "error": f"Unsupported modality '{modality}'.",
-            "supported": sorted(SUPPORTED_MODALITIES),
-            "planned": sorted(FUTURE_MODALITIES),
-        }
+        return _api_error(
+            f"Unsupported modality '{modality}'.",
+            "unsupported_modality",
+            supported=sorted(SUPPORTED_MODALITIES),
+            planned=sorted(FUTURE_MODALITIES),
+        )
     if not _ready:
-        return {"error": _init_error or "Index initializing"}
+        return _api_error(_init_error or "Index initializing", "index_initializing")
 
     if _index is None:
         _load_or_build_index()
 
     if _index is None:
-        return {"error": _init_error or "Index unavailable"}
+        return _api_error(_init_error or "Index unavailable", "index_unavailable")
 
     start = time.perf_counter()
     results = _build_results(query, top_k, rerank, rerank_alpha)
@@ -748,6 +837,7 @@ def search(
     _update_query_metrics(latency_ms)
 
     payload = {
+        "ok": True,
         "query": query,
         "modality": modality,
         "top_k": top_k,
@@ -781,79 +871,64 @@ def rag(
     modality: str = Query("image"),
 ):
     if modality not in SUPPORTED_MODALITIES:
-        return {
-            "error": f"Unsupported modality '{modality}'.",
-            "supported": sorted(SUPPORTED_MODALITIES),
-            "planned": sorted(FUTURE_MODALITIES),
-        }
+        return _api_error(
+            f"Unsupported modality '{modality}'.",
+            "unsupported_modality",
+            supported=sorted(SUPPORTED_MODALITIES),
+            planned=sorted(FUTURE_MODALITIES),
+        )
     if not _ready:
-        return {"error": _init_error or "Index initializing"}
+        return _api_error(_init_error or "Index initializing", "index_initializing")
 
     if ollama is None:
-        return {"error": "Ollama client not available"}
+        return _api_error("Ollama client not available", "ollama_unavailable")
 
     start = time.perf_counter()
     results = _build_results(query, top_k, rerank, rerank_alpha)
     latency_ms = (time.perf_counter() - start) * 1000.0
     _update_query_metrics(latency_ms)
     if not results:
-        return {"error": "No results available"}
-
-    context_lines = []
-    for item in results:
-        caption = item.get("caption") or "no caption"
-        score_pct = item["score"] * 100.0
-        context_lines.append(
-            f"{item['rank']}. {item['file_name']} | score {score_pct:.1f}% | caption: {caption}"
-        )
-
-    prompt = (
-        "Respond in English. Do not translate the query unless needed for clarity. Use only the provided context.\n"
-        "Do not invent objects or actions that are not present. If information is missing, say so briefly.\n"
-        "Return STRICT valid JSON only, with no extra text, using this schema:\n"
-        "{ \"summary\": string, \"items\": ["
-        "{ \"file_name\": string, \"caption\": string, \"score_pct\": number }"
-        "] }\n"
-        "Example:\n"
-        "{ \"summary\": \"3 relevant results.\", \"items\": ["
-        "{ \"file_name\": \"0001.jpg\", \"caption\": \"dogs running\", \"score_pct\": 41.2 }"
-        "] }\n\n"
-        f"Query: {query}\n"
-        "Context:\n"
-        + "\n".join(context_lines)
-        + "\n\nAnswer:"
-    )
+        return _api_error("No results available", "no_results")
 
     selected_model = model or RAG_MODEL
-    llm_start = time.perf_counter()
     try:
-        response = ollama.generate(
-            model=selected_model,
-            prompt=prompt,
-            options={
-                "temperature": RAG_TEMPERATURE,
-                "top_p": RAG_TOP_P,
-                "num_predict": RAG_NUM_PREDICT,
-            },
+        rag_payload = _run_rag(query, results, selected_model)
+    except TimeoutError as exc:
+        _metrics["rag_failures"] += 1
+        _append_metrics_event(
+            {
+                "type": "rag",
+                "query": query,
+                "modality": modality,
+                "top_k": top_k,
+                "model": selected_model,
+                "status": "error",
+                "error": str(exc),
+            }
         )
+        return _api_error(str(exc), "ollama_timeout")
     except Exception as exc:
-        return {"error": f"Ollama error: {exc}"}
-    llm_ms = (time.perf_counter() - llm_start) * 1000.0
-    raw_text = response.get("response", "")
-    formatted = _parse_structured_response(
-        raw_text, _build_structured_fallback(query, results)
-    )
+        _metrics["rag_failures"] += 1
+        _append_metrics_event(
+            {
+                "type": "rag",
+                "query": query,
+                "modality": modality,
+                "top_k": top_k,
+                "model": selected_model,
+                "status": "error",
+                "error": str(exc),
+            }
+        )
+        return _api_error(f"Ollama error: {exc}", "ollama_error")
 
     payload = {
-        "query": query,
+        **rag_payload,
         "modality": modality,
         "top_k": top_k,
         "rerank": rerank,
         "rerank_alpha": rerank_alpha,
         "latency_ms": round(latency_ms, 2),
-        "model": selected_model,
-        "llm_ms": round(llm_ms, 2),
-        "answer": formatted,
         "results": results,
     }
     _append_metrics_event(
@@ -864,86 +939,66 @@ def rag(
             "top_k": top_k,
             "model": selected_model,
             "latency_ms": round(latency_ms, 2),
-            "llm_ms": round(llm_ms, 2),
+            "llm_ms": payload["llm_ms"],
             "results": len(results),
+            "status": "ok",
+            "cache_hit": payload["cache_hit"],
+            "prompt_tokens": payload.get("prompt_tokens"),
+            "completion_tokens": payload.get("completion_tokens"),
         }
     )
     return payload
 
 
 @app.post("/explain")
-def explain(payload: dict):
+def explain(payload: ExplainRequest):
     if not _ready:
-        return {"error": _init_error or "Index initializing"}
+        return _api_error(_init_error or "Index initializing", "index_initializing")
 
     if ollama is None:
-        return {"error": "Ollama client not available"}
+        return _api_error("Ollama client not available", "ollama_unavailable")
 
-    query = payload.get("query")
-    results = payload.get("results") or []
-    if not query or not results:
-        return {"error": "Missing query or results"}
-
-    context_lines = []
-    for idx, item in enumerate(results, start=1):
-        caption = item.get("caption") or "no caption"
-        score = item.get("score", 0.0)
-        score_pct = score * 100.0
-        file_name = item.get("file_name") or f"item_{idx}"
-        context_lines.append(
-            f"{idx}. {file_name} | score {score_pct:.1f}% | caption: {caption}"
-        )
-
-    prompt = (
-        "Respond in English. Do not translate the query unless needed for clarity. Use only the provided context.\n"
-        "Do not invent objects or actions that are not present. If information is missing, say so briefly.\n"
-        "Return STRICT valid JSON only, with no extra text, using this schema:\n"
-        "{ \"summary\": string, \"items\": ["
-        "{ \"file_name\": string, \"caption\": string, \"score_pct\": number }"
-        "] }\n"
-        "Example:\n"
-        "{ \"summary\": \"3 relevant results.\", \"items\": ["
-        "{ \"file_name\": \"0001.jpg\", \"caption\": \"dogs running\", \"score_pct\": 41.2 }"
-        "] }\n\n"
-        f"Query: {query}\n"
-        "Context:\n"
-        + "\n".join(context_lines)
-        + "\n\nAnswer:"
-    )
-
-    selected_model = payload.get("model") or RAG_MODEL
-    llm_start = time.perf_counter()
+    query = payload.query
+    results = [item.model_dump() for item in payload.results]
+    selected_model = payload.model or RAG_MODEL
     try:
-        response = ollama.generate(
-            model=selected_model,
-            prompt=prompt,
-            options={
-                "temperature": RAG_TEMPERATURE,
-                "top_p": RAG_TOP_P,
-                "num_predict": RAG_NUM_PREDICT,
-            },
+        response_payload = _run_rag(query, results, selected_model)
+    except TimeoutError as exc:
+        _metrics["rag_failures"] += 1
+        _append_metrics_event(
+            {
+                "type": "explain",
+                "query": query,
+                "model": selected_model,
+                "status": "error",
+                "error": str(exc),
+            }
         )
+        return _api_error(str(exc), "ollama_timeout")
     except Exception as exc:
-        return {"error": f"Ollama error: {exc}"}
-    llm_ms = (time.perf_counter() - llm_start) * 1000.0
-    raw_text = response.get("response", "")
-    formatted = _parse_structured_response(
-        raw_text, _build_structured_fallback(query, results)
-    )
+        _metrics["rag_failures"] += 1
+        _append_metrics_event(
+            {
+                "type": "explain",
+                "query": query,
+                "model": selected_model,
+                "status": "error",
+                "error": str(exc),
+            }
+        )
+        return _api_error(f"Ollama error: {exc}", "ollama_error")
 
-    response_payload = {
-        "query": query,
-        "model": selected_model,
-        "llm_ms": round(llm_ms, 2),
-        "explanation": formatted,
-    }
     _append_metrics_event(
         {
             "type": "explain",
             "query": query,
             "model": selected_model,
-            "llm_ms": round(llm_ms, 2),
+            "llm_ms": response_payload["llm_ms"],
             "results": len(results),
+            "status": "ok",
+            "cache_hit": response_payload["cache_hit"],
+            "prompt_tokens": response_payload.get("prompt_tokens"),
+            "completion_tokens": response_payload.get("completion_tokens"),
         }
     )
     return response_payload
@@ -952,18 +1007,13 @@ def explain(payload: dict):
 @app.get("/metrics")
 def metrics(evaluate: bool = False, sample_size: int = 200):
     if not _ready:
-        return {"error": _init_error or "Index initializing"}
-
-    avg_query_ms = None
-    if _metrics["query_count"]:
-        avg_query_ms = round(
-            _metrics["query_total_ms"] / _metrics["query_count"], 2
-        )
+        return _api_error(_init_error or "Index initializing", "index_initializing")
 
     response = {
+        "ok": True,
         "metrics": {
             **_metrics,
-            "avg_query_ms": avg_query_ms,
+            "avg_query_ms": _avg_query_ms(),
         }
     }
 
@@ -974,34 +1024,17 @@ def metrics(evaluate: bool = False, sample_size: int = 200):
 
 @app.get("/metrics/summary")
 def metrics_summary(limit: int = 1000):
-    return _summarize_metrics_from_log(limit=limit)
+    return {"ok": True, **_summarize_metrics_from_log(limit=limit)}
 
 
 @app.get("/metrics/log")
 def metrics_log(limit: int = 200):
-    if not METRICS_LOG_FILE.exists():
-        return {"events": []}
-    events = []
-    try:
-        with METRICS_LOG_FILE.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except Exception:
-                    continue
-        if limit and len(events) > limit:
-            events = events[-limit:]
-    except Exception:
-        return {"events": []}
-    return {"events": events}
+    return {"ok": True, "events": load_jsonl_events(METRICS_LOG_FILE, limit=limit)}
 
 
 @app.get("/ollama/models")
 def ollama_models():
-    return _list_ollama_models()
+    return {"ok": True, **_list_ollama_models()}
 
 
 if __name__ == "__main__":
