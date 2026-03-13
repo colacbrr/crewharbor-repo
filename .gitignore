@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.venv/
+venv/
+mir_venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+
+# Dataset and generated artifacts
+backend/val2017/
+backend/annotations/
+backend/outputs/

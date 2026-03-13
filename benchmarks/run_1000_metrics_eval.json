@@ -1,0 +1,1 @@
+{"metrics":{"embeddings_source":"loaded","encoding_time_sec":null,"index_build_time_sec":0.002,"image_count":1000,"query_count":0,"query_total_ms":0.0,"last_query_ms":null,"avg_query_ms":null},"evaluation":{"sample_size":200,"avg_query_ms":6.92,"recall":{"recall@1":0.46,"recall@5":0.755,"recall@10":0.88}}}
