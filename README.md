@@ -1,4 +1,4 @@
-# Semantic Multimedia Retrieval with Grounded Explanations
+# Semantic Multimedia Retrieval System with Grounded Explanations
 
 This project is a local-first multimedia retrieval system that turns natural-language queries into image search results, then generates a grounded explanation over the retrieved evidence.
 
@@ -71,6 +71,12 @@ More detail:
 - [Results](docs/results.md)
 - [Workflow](docs/workflow.md)
 - [Research Notes](docs/research-notes.md)
+
+## Recommended Project Title
+
+If you want a descriptive public title, use:
+
+`Semantic Multimedia Retrieval System with Grounded Explanations`
 
 ## Current Scope
 
@@ -191,6 +197,32 @@ backend/val2017/
 backend/annotations/captions_val2017.json
 ```
 
+You can download the required files directly from the official COCO dataset mirrors:
+
+```bash
+cd backend
+
+wget http://images.cocodataset.org/zips/val2017.zip
+wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+
+unzip val2017.zip
+unzip annotations_trainval2017.zip
+
+rm val2017.zip
+rm annotations_trainval2017.zip
+```
+
+After extraction, the backend should contain:
+
+```text
+backend/
+  val2017/
+  annotations/
+    captions_val2017.json
+```
+
+Only `val2017/` and `annotations/captions_val2017.json` are required for the current image retrieval workflow.
+
 ## API Quickstart
 
 Search:
@@ -231,6 +263,21 @@ Useful endpoints:
 - dataset assets are not bundled in the repo
 - local generation is significantly slower than retrieval
 - the current explanation layer is not yet a full citation-rich RAG stack
+
+## Next Improvements
+
+The most useful next steps for this repository are:
+
+- embed screenshots directly into the root README
+- add a small API smoke test for `/search` and `/explain`
+- add a task runner such as a `Makefile` for setup, run, and test commands
+- add Docker or `docker-compose` for reproducible local startup
+- extend evaluation beyond retrieval latency and Recall@K
+- expand the system toward video and audio retrieval
+
+## License
+
+This repository is licensed under the MIT License. See [LICENSE](LICENSE).
 
 ## Screenshots
 

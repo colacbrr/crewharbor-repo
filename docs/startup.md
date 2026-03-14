@@ -65,6 +65,26 @@ backend/
     captions_val2017.json
 ```
 
+Official download example:
+
+```bash
+cd backend
+
+wget http://images.cocodataset.org/zips/val2017.zip
+wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+
+unzip val2017.zip
+unzip annotations_trainval2017.zip
+
+rm val2017.zip
+rm annotations_trainval2017.zip
+```
+
+This project only needs:
+
+- `val2017/`
+- `annotations/captions_val2017.json`
+
 If these folders are missing, the backend can start, but retrieval will not work correctly.
 
 ## 3. Start The Backend
